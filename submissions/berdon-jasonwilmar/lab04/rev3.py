@@ -1,8 +1,6 @@
 """
 structural_solver.py  ·  Rev 3
-Load-case framework (self-weight, member UDL, member point, thermal,
-wind/seismic), NSCP-style LRFD + ASD combinations, diaphragm definition
-and per-case validation on top of the Rev 2 direct-stiffness solver.
+Load-case framework + NSCP-style LRFD/ASD combos on the Rev 2 solver.
 
 Run:
     python structural_solver.py               # native window if pywebview, else browser
@@ -13,8 +11,8 @@ import json
 import os
 import socket
 import sys
-import tempfile
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -81,7 +79,6 @@ HTML = r"""<!DOCTYPE html>
   .mini-btn:hover { background:#f3effa; border-color:#a48bcf; }
 
   .main { flex:1; display:flex; min-height:0; }
-
   .left-panel { width:250px; background:#f7f7fb; border-right:1px solid #c8c8d2;
                 display:flex; flex-direction:column; overflow:hidden; }
   .panel-header { height:26px; background:linear-gradient(180deg,#6b3fa0 0%,#4a2472 100%);
@@ -157,10 +154,8 @@ HTML = r"""<!DOCTYPE html>
   table.sheet tbody td.err { color:#b00020; font-weight:700; }
   .cat-badge { display:inline-block; padding:1px 6px; border-radius:8px; font-size:10px;
                font-weight:700; color:#fff; background:#6b3fa0; }
-  .cat-D { background:#7a4a2e; }
-  .cat-L { background:#2e7d32; }
-  .cat-W { background:#1565c0; }
-  .cat-E { background:#b8860b; }
+  .cat-D { background:#7a4a2e; } .cat-L { background:#2e7d32; }
+  .cat-W { background:#1565c0; } .cat-E { background:#b8860b; }
   .cat-T { background:#c0392b; }
 
   .statusbar { height:24px; background:#e8e6f2; border-top:1px solid #c8c8d2;
@@ -170,21 +165,12 @@ HTML = r"""<!DOCTYPE html>
   .statusbar .right { margin-left:auto; display:flex; gap:18px; }
   .statusbar b { color:#4a2472; }
 
-  .modal-overlay { position:fixed; inset:0; background:rgba(30,20,60,.35);
-                   display:flex; align-items:center; justify-content:center; z-index:1000; }
-  .modal-box { background:#fff; border-radius:6px; min-width:380px;
-               box-shadow:0 12px 40px rgba(0,0,0,.3); border-top:4px solid #6b3fa0; font-size:12px; }
-  .modal-header { padding:10px 16px; font-weight:700; color:#4a2472;
-                  font-size:13px; border-bottom:1px solid #ebe9f5; }
-  .modal-body { padding:12px 16px; display:grid; grid-template-columns:120px 1fr;
-                gap:8px 10px; align-items:center; max-height:70vh; overflow:auto; }
-  .modal-footer { padding:10px 16px; border-top:1px solid #ebe9f5;
-                  display:flex; gap:8px; justify-content:flex-end; }
-  .modal-footer button { min-width:90px; height:28px; border-radius:3px;
-                         border:1px solid #c8c8d2; background:#f4f4f8; font-size:12px; }
-  .modal-footer button.primary { background:#6b3fa0; border-color:#4a2472;
-                                 color:#fff; font-weight:700; }
-  .modal-footer button.primary:hover { background:#7c4cb8; }
+  .excel-warn { background:#fff3cd; border-bottom:1px solid #f0c36d;
+                color:#7a4a02; padding:6px 12px; font-size:11px; display:none; }
+  .excel-warn.show { display:block; }
+  .excel-warn b { color:#b00; }
+  .excel-warn code { background:#fff; padding:1px 4px; border-radius:2px;
+                     border:1px solid #f0c36d; }
 </style>
 </head>
 <body>
@@ -199,6 +185,10 @@ HTML = r"""<!DOCTYPE html>
 <div class="menubar">
   <span>File</span><span>Edit</span><span>View</span><span>Insert</span>
   <span>Modify</span><span>Tools</span><span>Window</span><span>Help</span>
+</div>
+
+<div class="excel-warn" id="excel-warn">
+  <b>Excel link:</b> <span id="excel-warn-msg">…</span>
 </div>
 
 <div class="ribbon">
@@ -321,37 +311,30 @@ HTML = r"""<!DOCTYPE html>
         <div class="node leaf sel" onclick="focusSheet('nodes')">Nodes (8)</div>
         <div class="node leaf" onclick="focusSheet('members')">Members (12)</div>
       </div>
-
       <div class="node open" onclick="toggleGroup('g-supp', this)">Supports</div>
       <div class="child open" id="g-supp">
         <div class="node leaf" onclick="focusSheet('supports')">Pinned (4)</div>
       </div>
-
       <div class="node open" onclick="toggleGroup('g-dia', this)">Diaphragm</div>
       <div class="child open" id="g-dia">
         <div class="node leaf" onclick="focusSheet('diaphragm')">Roof (master N5)</div>
       </div>
-
       <div class="node open" onclick="toggleGroup('g-mat', this)">Materials</div>
       <div class="child open" id="g-mat">
         <div class="node leaf" onclick="focusSheet('materials')" id="tree-mat">A992</div>
       </div>
-
       <div class="node open" onclick="toggleGroup('g-sec', this)">Sections</div>
       <div class="child open" id="g-sec">
         <div class="node leaf" onclick="focusSheet('sections')" id="tree-sec">Section Library</div>
       </div>
-
       <div class="node open" onclick="toggleGroup('g-load', this)">Load Cases</div>
       <div class="child open" id="g-load">
         <div class="node leaf" onclick="focusSheet('loadcases')">9 cases (D,L,W,E,T)</div>
       </div>
-
       <div class="node open" onclick="toggleGroup('g-combo', this)">Combinations</div>
       <div class="child open" id="g-combo">
         <div class="node leaf" onclick="focusSheet('combos')">LRFD + ASD</div>
       </div>
-
       <div class="node open" onclick="toggleGroup('g-res', this)">Results</div>
       <div class="child open" id="g-res">
         <div class="node leaf" onclick="focusSheet('disp')">Joint Displacements</div>
@@ -369,7 +352,6 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <div class="viewport">
       <div id="three-canvas"></div>
-
       <div class="view-overlay">
         <div><b>Case:</b> <span id="ov-case">1 · DEAD / SELF WEIGHT</span></div>
         <div><b>Material:</b> <span id="ov-mat">A992</span></div>
@@ -380,13 +362,11 @@ HTML = r"""<!DOCTYPE html>
           Use the ribbon to switch cases / combinations.
         </span>
       </div>
-
       <div class="view-toolbar">
         <button title="Zoom in"  onclick="zoomView(1.15)">+</button>
         <button title="Zoom out" onclick="zoomView(0.87)">−</button>
         <button title="Reset"    onclick="resetView()">⟲</button>
       </div>
-
       <div class="view-status" id="view-status">Ready.</div>
     </div>
   </div>
@@ -436,25 +416,28 @@ HTML = r"""<!DOCTYPE html>
 <script>
 /* ==================================================================
    LIVE EXCEL BRIDGE
+   ------------------------------------------------------------------
+   The page is served from the same host:port as /sync, so we can use
+   relative URLs and skip CORS entirely.
    ================================================================== */
-const EXCEL_SYNC_PORT = __SYNC_PORT__;
 let _syncTimer = null;
+let _lastSyncError = null;
 
 function syncToExcel() {
   clearTimeout(_syncTimer);
   _syncTimer = setTimeout(() => {
-    const { F } = buildActiveLoad();
-    // Flatten to a "loads" array keyed by node for workbook compatibility
+    const { F } = buildActiveLoad();          // kN / kN·m
     const byNode = {};
     for (let i = 0; i < 8; i++) {
       const nid = i + 1;
-      const fx = F[i*6]   / 1000;
-      const fy = F[i*6+1] / 1000;
-      const fz = F[i*6+2] / 1000;
-      const mx = F[i*6+3] / 1000;
-      const my = F[i*6+4] / 1000;
-      const mz = F[i*6+5] / 1000;
-      if (Math.abs(fx)+Math.abs(fy)+Math.abs(fz)+Math.abs(mx)+Math.abs(my)+Math.abs(mz) > 1e-9)
+      const fx = dF(F[i*6]);
+      const fy = dF(F[i*6+1]);
+      const fz = dF(F[i*6+2]);
+      const mx = dM(F[i*6+3]);
+      const my = dM(F[i*6+4]);
+      const mz = dM(F[i*6+5]);
+      if (Math.abs(fx)+Math.abs(fy)+Math.abs(fz)+
+          Math.abs(mx)+Math.abs(my)+Math.abs(mz) > 1e-12)
         byNode[nid] = { node:nid, fx, fy, fz, mx, my, mz };
     }
     const state = {
@@ -464,17 +447,19 @@ function syncToExcel() {
       activeCase: activeComboId ? ('COMBO ' + activeComboId) : ('LC' + activeCaseId),
       loads: Object.values(byNode),
     };
-    try {
-      fetch(`http://127.0.0.1:${EXCEL_SYNC_PORT}/sync`, {
-        method: 'POST', body: JSON.stringify(state),
-      }).then(r => r.text()).then(msg => {
-        if (msg.startsWith('ok (live)')) setSyncStatus('live', msg);
-        else if (msg.startsWith('ok'))    setSyncStatus('file', msg);
-        else                              setSyncStatus('error', msg);
-      }).catch(() => setSyncStatus('offline', 'Excel bridge not reachable'));
-    } catch (e) {
-      setSyncStatus('offline', 'Excel bridge not reachable');
-    }
+    fetch('/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify(state),
+    }).then(r => r.text()).then(msg => {
+      _lastSyncError = null;
+      if (msg.startsWith('ok (live)'))  setSyncStatus('live', msg);
+      else if (msg.startsWith('ok'))    setSyncStatus('file', msg);
+      else                              setSyncStatus('error', msg);
+    }).catch(err => {
+      _lastSyncError = String(err);
+      setSyncStatus('offline', 'Excel bridge not reachable: ' + err);
+    });
   }, 150);
 }
 
@@ -487,6 +472,40 @@ function setSyncStatus(state, detail) {
   el.style.color = colors[state] || '#999';
   el.textContent = labels[state] || 'Excel: —';
   el.title = detail || '';
+}
+
+function showExcelWarn(html) {
+  const bar = document.getElementById('excel-warn');
+  const msg = document.getElementById('excel-warn-msg');
+  if (!bar || !msg) return;
+  if (!html) { bar.classList.remove('show'); msg.innerHTML = ''; return; }
+  msg.innerHTML = html;
+  bar.classList.add('show');
+}
+
+function refreshExcelStatus() {
+  fetch('/status').then(r => r.json()).then(s => {
+    if (s.mode === 'live') {
+      setSyncStatus('live', s.detail || 'xlwings attached');
+      showExcelWarn(null);
+    } else if (s.mode === 'file') {
+      setSyncStatus('file', s.detail || 'openpyxl file mode');
+      showExcelWarn(
+        'Excel is <b>not</b> live &mdash; running in file mode. ' +
+        'Workbook: <code>' + (s.workbook || '?') + '</code>. ' +
+        'Close and reopen it after each change, or run ' +
+        '<code>pip install xlwings</code> and restart this app for live cells.'
+      );
+    } else {
+      setSyncStatus('offline', s.detail || s.mode);
+      showExcelWarn(
+        'Excel bridge not active: <b>' + (s.detail || s.mode) + '</b>. ' +
+        'See the Python console for details.'
+      );
+    }
+  }).catch(() => {
+    setSyncStatus('offline', 'server not reachable');
+  });
 }
 
 /* ==================================================================
@@ -525,14 +544,12 @@ const NODES = {
   1:[0,0,0], 2:[6,0,0], 3:[6,0,6], 4:[0,0,6],
   5:[0,6,0], 6:[6,6,0], 7:[6,6,6], 8:[0,6,6]
 };
-
-// [n1, n2, beta_deg, release_start, release_end]
 const MEMBERS = [
   [1,2,0,null,null],[2,3,0,null,null],[3,4,0,null,null],[4,1,0,null,null],
   [5,6,0,null,null],[6,7,0,null,null],[7,8,0,null,null],[8,5,0,null,null],
   [1,5,90,'rz',null],[2,6,90,'rz',null],[3,7,90,'rz',null],[4,8,90,'rz',null]
 ];
-const ROOF_BEAM_IDX   = [4,5,6,7];        // members M5..M8 (0-based)
+const ROOF_BEAM_IDX   = [4,5,6,7];
 const ALL_MEMBER_IDX  = [0,1,2,3,4,5,6,7,8,9,10,11];
 const ROOF_NODES      = [5,6,7,8];
 
@@ -556,7 +573,6 @@ function getSection(name){ return SECTIONS.find(s => s.name === name) || SECTION
 
 const SEC_BASE = { E:199948e6, G:76904e6 };
 const MATERIALS = [
-  // [category, label, E(MPa), G(MPa), ν, α(1e-6/°C), γ(kN/m³), Fy(MPa), Fu(MPa)]
   ['Hot Rolled','A36 Gr.36',   199948, 76904, 0.30, 11.7, 76.97, 248.2, 399.9],
   ['Hot Rolled','A572 Gr.50',  199948, 76904, 0.30, 11.7, 76.97, 344.7, 399.9],
   ['Hot Rolled','A992',        199948, 76904, 0.30, 11.7, 76.97, 344.7, 399.9],
@@ -571,8 +587,8 @@ const MATERIALS = [
 ];
 let currentMaterial = 'A992';
 function currentMaterialRow(){ return MATERIALS.find(r => r[1] === currentMaterial) || MATERIALS[2]; }
-function currentAlpha(){ return currentMaterialRow()[5] * 1e-6; } // 1/°C
-function currentGamma(){ return currentMaterialRow()[6]; }        // kN/m³
+function currentAlpha(){ return currentMaterialRow()[5] * 1e-6; }
+function currentGamma(){ return currentMaterialRow()[6]; }
 
 function applyMaterial(label) {
   const m = MATERIALS.find(row => row[1] === label);
@@ -593,58 +609,44 @@ function updateMaterialLabels() {
 }
 
 /* ==================================================================
-   2. LOAD-CASE FRAMEWORK  (Rev 3)
+   2. LOAD-CASE FRAMEWORK
    ================================================================== */
 const DIAPHRAGM = {
-  id: 1,
-  name: 'Roof Diaphragm',
-  master: 5,
-  slaves: [6, 7, 8],
+  id: 1, name: 'Roof Diaphragm', master: 5, slaves: [6, 7, 8],
   dofs: ['UX', 'UZ', 'RY'],
   note: 'Master node 5 couples UX, UZ and RY of nodes 6, 7, 8 at roof elevation y=6 m.',
 };
 
 const LOAD_CASES = [
   { id:1, name:'DEAD / SELF WEIGHT', category:'D', kind:'SelfWeight',
-    desc:'Self-weight γ·A·L on all members, direction Global −Y',
-    selfWeight:true },
-
+    desc:'Self-weight γ·A·L on all members, direction Global −Y', selfWeight:true },
   { id:2, name:'ROOF DEAD', category:'D', kind:'Member UDL',
     desc:'5 kN/m downward on roof beams M5–M8',
     udl:{ members: ROOF_BEAM_IDX, mag: 5.0, dir: [0,-1,0] } },
-
   { id:3, name:'ROOF LIVE', category:'L', kind:'Member UDL',
     desc:'3 kN/m downward on roof beams M5–M8',
     udl:{ members: ROOF_BEAM_IDX, mag: 3.0, dir: [0,-1,0] } },
-
   { id:4, name:'ROOF BEAM CENTER LOAD', category:'L', kind:'Member Point',
     desc:'5 kN at midspan of each roof beam M5–M8, direction Global −Y',
     point:{ members: ROOF_BEAM_IDX, mag: 5.0, loc: 0.5, dir: [0,-1,0] } },
-
   { id:5, name:'WIND X', category:'W', kind:'Nodal',
     desc:'10 kN total in +X, distributed equally among roof nodes 5–8',
     nodal:{ nodes: ROOF_NODES, f:[2.5, 0, 0, 0, 0, 0] } },
-
   { id:6, name:'WIND Z', category:'W', kind:'Nodal',
     desc:'10 kN total in +Z, distributed equally among roof nodes 5–8',
     nodal:{ nodes: ROOF_NODES, f:[0, 0, 2.5, 0, 0, 0] } },
-
   { id:7, name:'SEISMIC X', category:'E', kind:'Nodal',
     desc:'15 kN total in +X, distributed equally among roof nodes 5–8',
     nodal:{ nodes: ROOF_NODES, f:[3.75, 0, 0, 0, 0, 0] } },
-
   { id:8, name:'SEISMIC Z', category:'E', kind:'Nodal',
     desc:'15 kN total in +Z, distributed equally among roof nodes 5–8',
     nodal:{ nodes: ROOF_NODES, f:[0, 0, 3.75, 0, 0, 0] } },
-
   { id:9, name:'TEMPERATURE +15 °C', category:'T', kind:'Thermal',
     desc:'Uniform +15 °C on all members; ε=α·ΔT; self-equilibrating axial pair',
     thermal:{ members: ALL_MEMBER_IDX, dT: 15.0 } },
 ];
 
-// NSCP-style LRFD + ASD combinations.  `factors` maps case-id -> factor.
 const COMBINATIONS = [
-  // --- LRFD / Factored (NSCP 203 / ASCE 7 LRFD) ---
   { id:101, name:'1.4D',                          method:'LRFD', factors:{1:1.4} },
   { id:102, name:'1.2D + 1.6L',                   method:'LRFD', factors:{1:1.2, 3:1.6} },
   { id:103, name:'1.2D + 1.6Lr',                  method:'LRFD', factors:{1:1.2, 2:1.6} },
@@ -656,12 +658,10 @@ const COMBINATIONS = [
   { id:109, name:'0.9D + 1.0W (Z)',               method:'LRFD', factors:{1:0.9, 6:1.0} },
   { id:110, name:'0.9D + 1.0E',                   method:'LRFD', factors:{1:0.9, 7:1.0} },
   { id:111, name:'0.9D + 1.0E (Z)',               method:'LRFD', factors:{1:0.9, 8:1.0} },
-  // --- LRFD with Temperature (T as its own category) ---
   { id:112, name:'1.2D + 1.0T + 0.5L',            method:'LRFD', factors:{1:1.2, 9:1.0, 3:0.5} },
   { id:113, name:'1.2D + 1.0T + 1.0L',            method:'LRFD', factors:{1:1.2, 9:1.0, 3:1.0} },
   { id:114, name:'1.2D + 1.0T + 0.5W',            method:'LRFD', factors:{1:1.2, 9:1.0, 5:0.5} },
   { id:115, name:'0.9D + 1.0T',                   method:'LRFD', factors:{1:0.9, 9:1.0} },
-  // --- ASD / Allowable-stress (non-factored) ---
   { id:201, name:'D',                             method:'ASD',  factors:{1:1.0} },
   { id:202, name:'D + L',                         method:'ASD',  factors:{1:1.0, 3:1.0} },
   { id:203, name:'D + Lr',                        method:'ASD',  factors:{1:1.0, 2:1.0} },
@@ -674,7 +674,6 @@ const COMBINATIONS = [
   { id:210, name:'0.6D + 0.6W',                   method:'ASD',  factors:{1:0.6, 5:0.6} },
   { id:211, name:'0.6D + 0.6W (Z)',               method:'ASD',  factors:{1:0.6, 6:0.6} },
   { id:212, name:'0.6D + 0.7E',                   method:'ASD',  factors:{1:0.6, 7:0.7} },
-  // --- ASD with Temperature ---
   { id:213, name:'D + 0.75T',                     method:'ASD',  factors:{1:1.0, 9:0.75} },
   { id:214, name:'D + 0.75L + 0.75T',             method:'ASD',  factors:{1:1.0, 3:0.75, 9:0.75} },
   { id:215, name:'D + 0.75T + 0.75W',             method:'ASD',  factors:{1:1.0, 9:0.75, 5:0.75} },
@@ -725,7 +724,7 @@ function solveLinear(A,b){
 }
 
 /* ==================================================================
-   4. MEMBER TRANSFORM + LOCAL STIFFNESS  (Rev 2, unchanged)
+   4. MEMBER TRANSFORM + LOCAL STIFFNESS
    ================================================================== */
 function memberTransform(n1, n2, betaDeg){
   const p1 = NODES[n1], p2 = NODES[n2];
@@ -748,7 +747,6 @@ function memberTransform(n1, n2, betaDeg){
   const nr = norm(eyRot);
   const eyF = [eyRot[0]/nr, eyRot[1]/nr, eyRot[2]/nr];
   const ezF = cross(ex, eyF);
-  // T[i][j] = (i-th component of local axis j)  →  columns are ex, ey, ez
   const T = [
     [ex[0], eyF[0], ezF[0]],
     [ex[1], eyF[1], ezF[1]],
@@ -796,12 +794,7 @@ function beamStiff(L, rel_s, rel_e, section){
 }
 
 /* ==================================================================
-   5. EQUIVALENT-NODAL-LOAD ASSEMBLY  (Rev 3)
-   ------------------------------------------------------------------
-   All returns are in kN / kN·m (the internal solver multiplies by 1000).
-   `thermalF0` collects the local 12-vector of thermal initial-strain
-   nodal loads per member so the member-force post-processing can
-   subtract them (kL·uL − f0).
+   5. EQUIVALENT-NODAL-LOAD ASSEMBLY
    ================================================================== */
 function localToGlobal(ex, ey, ez, fL){
   const fG = new Float64Array(12);
@@ -817,7 +810,7 @@ function localToGlobal(ex, ey, ez, fL){
 function assembleUDL(Fkilo, mi, mag, dirGlobal){
   const mem = MEMBERS[mi];
   const { L, T, ex, ey, ez } = memberTransform(mem[0], mem[1], mem[2]);
-  const wG = [dirGlobal[0]*mag, dirGlobal[1]*mag, dirGlobal[2]*mag]; // kN/m
+  const wG = [dirGlobal[0]*mag, dirGlobal[1]*mag, dirGlobal[2]*mag];
   const wx = ex[0]*wG[0] + ex[1]*wG[1] + ex[2]*wG[2];
   const wy = ey[0]*wG[0] + ey[1]*wG[1] + ey[2]*wG[2];
   const wz = ez[0]*wG[0] + ez[1]*wG[1] + ez[2]*wG[2];
@@ -837,8 +830,8 @@ function assembleUDL(Fkilo, mi, mag, dirGlobal){
 function assemblePoint(Fkilo, mi, mag, dirGlobal, loc){
   const mem = MEMBERS[mi];
   const { L, T, ex, ey, ez } = memberTransform(mem[0], mem[1], mem[2]);
-  const a = loc, b = 1 - loc;                     // for loc=0.5 a=b=0.5
-  const PG = [dirGlobal[0]*mag, dirGlobal[1]*mag, dirGlobal[2]*mag]; // kN
+  const a = loc, b = 1 - loc;
+  const PG = [dirGlobal[0]*mag, dirGlobal[1]*mag, dirGlobal[2]*mag];
   const Px = ex[0]*PG[0] + ex[1]*PG[1] + ex[2]*PG[2];
   const Py = ey[0]*PG[0] + ey[1]*PG[1] + ey[2]*PG[2];
   const Pz = ez[0]*PG[0] + ez[1]*PG[1] + ez[2]*PG[2];
@@ -846,9 +839,6 @@ function assemblePoint(Fkilo, mi, mag, dirGlobal, loc){
   fL[0] = Px*b; fL[6] = Px*a;
   fL[1] = Py*b; fL[7] = Py*a;
   fL[2] = Pz*b; fL[8] = Pz*a;
-  // Fixed-end moments for a point load at fraction a from i-end:
-  //   Mz_i = +Py · L · a · b²  ; Mz_j = −Py · L · a² · b
-  //   My_i = −Pz · L · a · b²  ; My_j = +Pz · L · a² · b
   fL[5] =  Py * L * a * b * b;
   fL[11] = -Py * L * a * a * b;
   fL[4] = -Pz * L * a * b * b;
@@ -864,12 +854,11 @@ function assembleThermal(Fkilo, thermalF0, mi, dT){
   const mem = MEMBERS[mi];
   const sec = getSection(MEMBER_SECTIONS[mi]);
   const { L, T, ex, ey, ez } = memberTransform(mem[0], mem[1], mem[2]);
-  const EA = SEC_BASE.E * sec.A;              // N
-  const N = EA * currentAlpha() * dT;         // N   (compression for +dT, restrained)
-  // Equivalent nodal load in local coords (self-equilibrating pair):
+  const EA = SEC_BASE.E * sec.A;
+  const N = EA * currentAlpha() * dT;
   const f0L = new Float64Array(12);
-  f0L[0] = -N/1000;   // kN, end i
-  f0L[6] =  N/1000;   // kN, end j
+  f0L[0] = -N/1000;
+  f0L[6] =  N/1000;
   thermalF0[mi] = f0L;
   const fG = localToGlobal(ex, ey, ez, f0L);
   const i1 = mem[0]-1, i2 = mem[1]-1;
@@ -878,57 +867,47 @@ function assembleThermal(Fkilo, thermalF0, mi, dT){
   return { L, total: 0, N };
 }
 
-/* ---- Per-case assembly ----------------------------------------- */
 function buildCaseLoad(caseId){
   const ndof = Object.keys(NODES).length * 6;
-  const Fkilo = new Float64Array(ndof);          // kN, kN·m
+  const Fkilo = new Float64Array(ndof);
   const thermalF0 = {};
-  const sum = { caseId, totalApplied:0, nodeCount:0, memberCount:0,
-                detail:[] };
+  const sum = { caseId, totalApplied:0, nodeCount:0, memberCount:0, detail:[] };
   const c = LOAD_CASES.find(x => x.id === caseId);
   if (!c) return { F:Fkilo, thermalF0, summary:sum };
 
   if (c.selfWeight){
-    const gamma = currentGamma(); // kN/m³
+    const gamma = currentGamma();
     let total = 0;
     for (let mi=0; mi<MEMBERS.length; mi++){
       const sec = getSection(MEMBER_SECTIONS[mi]);
-      const w = gamma * sec.A;   // kN/m  (γ·A·L gives weight per unit length)
+      const w = gamma * sec.A;
       const { L, total: t } = assembleUDL(Fkilo, mi, w, [0,-1,0]);
       total += w * L;
       sum.memberCount++;
     }
     sum.totalApplied = total;
-    sum.detail.push(`γ = ${gamma} kN/m³, ${MEMBERS.length} members, ` +
-                    `Σ γ·A·L = ${total.toFixed(3)} kN`);
+    sum.detail.push(`γ = ${gamma} kN/m³, ${MEMBERS.length} members, Σ γ·A·L = ${total.toFixed(3)} kN`);
   }
-
   if (c.udl){
     const { members, mag, dir } = c.udl;
     let total = 0;
     for (const mi of members){
       const { total: t } = assembleUDL(Fkilo, mi, mag, dir);
-      total += t;
-      sum.memberCount++;
+      total += t; sum.memberCount++;
     }
     sum.totalApplied = total;
-    sum.detail.push(`UDL ${mag} kN/m on ${members.length} members, ` +
-                    `Σ w·L = ${total.toFixed(3)} kN`);
+    sum.detail.push(`UDL ${mag} kN/m on ${members.length} members, Σ w·L = ${total.toFixed(3)} kN`);
   }
-
   if (c.point){
     const { members, mag, loc, dir } = c.point;
     let total = 0;
     for (const mi of members){
       const { total: t } = assemblePoint(Fkilo, mi, mag, dir, loc);
-      total += t;
-      sum.memberCount++;
+      total += t; sum.memberCount++;
     }
     sum.totalApplied = total;
-    sum.detail.push(`Point ${mag} kN at x/L=${loc} on ${members.length} ` +
-                    `members, Σ P = ${total.toFixed(3)} kN`);
+    sum.detail.push(`Point ${mag} kN at x/L=${loc} on ${members.length} members, Σ P = ${total.toFixed(3)} kN`);
   }
-
   if (c.nodal){
     const { nodes, f } = c.nodal;
     for (const n of nodes){
@@ -937,10 +916,8 @@ function buildCaseLoad(caseId){
     }
     sum.nodeCount = nodes.length;
     sum.totalApplied = Math.hypot(f[0], f[1], f[2]) * nodes.length;
-    sum.detail.push(`${nodes.length} nodes × [${f.slice(0,3).join(', ')}] kN ` +
-                    `= ${sum.totalApplied.toFixed(3)} kN`);
+    sum.detail.push(`${nodes.length} nodes × [${f.slice(0,3).join(', ')}] kN = ${sum.totalApplied.toFixed(3)} kN`);
   }
-
   if (c.thermal){
     const { members, dT } = c.thermal;
     let maxN = 0;
@@ -950,15 +927,11 @@ function buildCaseLoad(caseId){
       sum.memberCount++;
     }
     sum.totalApplied = 0;
-    sum.detail.push(`ΔT = +${dT} °C on ${members.length} members, ` +
-                    `self-equilibrating; max |EA·α·ΔT| = ` +
-                    `${(Math.abs(maxN)/1000).toFixed(3)} kN`);
+    sum.detail.push(`ΔT = +${dT} °C on ${members.length} members, max |EA·α·ΔT| = ${(Math.abs(maxN)/1000).toFixed(3)} kN`);
   }
-
   return { F:Fkilo, thermalF0, summary:sum };
 }
 
-/* ---- Combination assembly -------------------------------------- */
 function buildComboLoad(comboId){
   const ndof = Object.keys(NODES).length * 6;
   const Fkilo = new Float64Array(ndof);
@@ -971,7 +944,6 @@ function buildComboLoad(comboId){
     const caseId = parseInt(caseIdStr, 10);
     const built = buildCaseLoad(caseId);
     for (let i = 0; i < ndof; i++) Fkilo[i] += factor * built.F[i];
-    // Merge thermal f0 vectors (scaled)
     for (const mi of Object.keys(built.thermalF0)){
       if (!thermalF0[mi]) thermalF0[mi] = new Float64Array(12);
       for (let k = 0; k < 12; k++)
@@ -993,12 +965,11 @@ function buildActiveLoad(){
 }
 
 /* ==================================================================
-   6. SOLVER  (takes a pre-built load vector + thermal f0 map)
+   6. SOLVER
    ================================================================== */
 function solveModel(loadData){
   const Fkilo = loadData.F;
   const thermalF0 = loadData.thermalF0 || {};
-
   const nodeIds = Object.keys(NODES).map(Number).sort((a,b)=>a-b);
   const idxMap = {}; nodeIds.forEach((n,i)=>idxMap[n]=i);
   const ndof = nodeIds.length * 6;
@@ -1031,7 +1002,7 @@ function solveModel(loadData){
   }
 
   const F = new Float64Array(ndof);
-  for (let i=0; i<ndof; i++) F[i] = Fkilo[i] * 1000;  // kN → N
+  for (let i=0; i<ndof; i++) F[i] = Fkilo[i] * 1000;
 
   const Kred = zeros(nFree, nFree);
   const Fred = new Float64Array(nFree);
@@ -1060,7 +1031,6 @@ function solveModel(loadData){
     const dofs = [];
     for (let d=0; d<6; d++) dofs.push(i1*6+d);
     for (let d=0; d<6; d++) dofs.push(i2*6+d);
-
     const uG = new Float64Array(12);
     for (let a=0; a<12; a++) uG[a] = U[dofs[a]];
     const uL = new Float64Array(12);
@@ -1076,13 +1046,10 @@ function solveModel(loadData){
       for (let j=0; j<12; j++) s += kL[i][j] * uL[j];
       fL[i] = s;
     }
-    // Subtract thermal initial-strain load
     const f0 = thermalF0[mid];
     if (f0){ for (let i=0; i<12; i++) fL[i] -= f0[i] * 1000; }
-
     members.push({
-      mid: mid + 1, n1, n2, L,
-      section: MEMBER_SECTIONS[mid],
+      mid: mid + 1, n1, n2, L, section: MEMBER_SECTIONS[mid],
       Fi: Array.from(fL.slice(0, 6)),
       Fj: Array.from(fL.slice(6, 12)),
     });
@@ -1111,17 +1078,12 @@ function materialRowDisp(m){
   return m;
 }
 
-function catBadge(cat){
-  return `<span class="cat-badge cat-${cat}">${cat}</span>`;
-}
-
 function setSheet(sheet){
   const thead = document.querySelector('#sheet thead');
   const tbody = document.querySelector('#sheet tbody');
   thead.innerHTML = ''; tbody.innerHTML = '';
 
-  let headers = [];
-  let rows = [];
+  let headers = [], rows = [];
 
   if (sheet === 'nodes'){
     headers = ['Node', `X (${labL()})`, `Y (${labL()})`, `Z (${labL()})`, 'Support Type', 'DOF Range'];
@@ -1184,8 +1146,7 @@ function setSheet(sheet){
     LOAD_CASES.forEach(c => {
       const built = buildCaseLoad(c.id);
       const s = built.summary;
-      rows.push([ c.id, c.category, c.name, c.kind, c.desc,
-                  s.totalApplied, s.nodeCount, s.memberCount ]);
+      rows.push([ c.id, c.category, c.name, c.kind, c.desc, s.totalApplied, s.nodeCount, s.memberCount ]);
     });
   }
   else if (sheet === 'combos'){
@@ -1206,12 +1167,9 @@ function setSheet(sheet){
         for (let d=0; d<6; d++) sumF[d] += built.F[i*6+d];
       const err = Math.hypot(sumF[0], sumF[1], sumF[2]);
       const ok = err < 1e-6;
-      const cls = ok ? 'ok' : 'warn';
-      rows.push([ `LC${c.id}`, c.category, s.totalApplied,
-                  s.nodeCount, s.memberCount, err,
+      rows.push([ `LC${c.id}`, c.category, s.totalApplied, s.nodeCount, s.memberCount, err,
                   ok ? 'OK' : 'net force ≠ 0' ]);
     });
-    // Breakdown per case
     LOAD_CASES.forEach(c => {
       const built = buildCaseLoad(c.id);
       built.summary.detail.forEach(line => {
@@ -1267,12 +1225,7 @@ function setSheet(sheet){
     const tr = document.createElement('tr');
     row.forEach((c, ci)=>{
       const td = document.createElement('td');
-      // Allow HTML for category badge
-      if (typeof c === 'string' && c.match(/^<span class="cat-badge/)) {
-        td.innerHTML = c;
-      } else {
-        td.textContent = (typeof c === 'number') ? formatNum(c) : c;
-      }
+      td.textContent = (typeof c === 'number') ? formatNum(c) : c;
       if (typeof c === 'number') td.classList.add('num');
       if (ri === 0 && ci === 0) td.classList.add('sel');
       td.onclick = () => {
@@ -1330,34 +1283,25 @@ const DEFORM_SCALE = 200;
 function initViewer(){
   const container = document.getElementById('three-canvas');
   const w = container.clientWidth, h = container.clientHeight;
-
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0xffffff);
-
   camera = new THREE.PerspectiveCamera(45, w/h, 0.1, 200);
   camera.position.set(12, 11, 14);
-
   renderer = new THREE.WebGLRenderer({ antialias:true });
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(w, h);
   container.appendChild(renderer.domElement);
-
   controls = new THREE.OrbitControls(camera, renderer.domElement);
   controls.target.set(3, 3, 3);
   controls.update();
-
   scene.add(new THREE.AmbientLight(0xffffff, 0.85));
   const d1 = new THREE.DirectionalLight(0xffffff, 0.6); d1.position.set(10,15,8); scene.add(d1);
   const d2 = new THREE.DirectionalLight(0xffffff, 0.35); d2.position.set(-8,-6,-10); scene.add(d2);
-
   const grid = new THREE.GridHelper(14, 28, 0xdddddd, 0xf0f0f0);
   grid.position.set(3,-0.01,3); scene.add(grid);
-
   addGlobalAxes();
-
   memberGroup = new THREE.Group(); scene.add(memberGroup);
   buildMemberTubes();
-
   Object.entries(NODES).forEach(([id,c])=>{
     const geo = new THREE.SphereGeometry(0.13, 20, 20);
     const mat = new THREE.MeshPhongMaterial({ color:0xc00000 });
@@ -1367,7 +1311,6 @@ function initViewer(){
     scene.add(mesh);
     nodeMeshes[id] = mesh;
   });
-
   Object.entries(SUPPORTS).forEach(([id,t])=>{
     if (t !== 'Pinned') return;
     const [x,y,z] = NODES[id];
@@ -1378,7 +1321,6 @@ function initViewer(){
     cone.rotation.y = Math.PI/4;
     scene.add(cone);
   });
-
   Object.entries(NODES).forEach(([id,c])=>{
     const canvas = document.createElement('canvas');
     canvas.width = 64; canvas.height = 64;
@@ -1394,19 +1336,16 @@ function initViewer(){
     sp.scale.set(0.6, 0.6, 1);
     scene.add(sp);
   });
-
-  loadGroup      = new THREE.Group(); scene.add(loadGroup);
-  deformedGroup  = new THREE.Group(); scene.add(deformedGroup);
+  loadGroup = new THREE.Group(); scene.add(loadGroup);
+  deformedGroup = new THREE.Group(); scene.add(deformedGroup);
   diaphragmGroup = new THREE.Group(); scene.add(diaphragmGroup);
   buildDiaphragm();
-
   renderer.domElement.addEventListener('click', onCanvasClick);
   window.addEventListener('resize', onResize);
   animate();
 }
 
 function buildDiaphragm(){
-  // translucent plane at y = 6 covering the roof
   const geo = new THREE.PlaneGeometry(6, 6);
   const mat = new THREE.MeshBasicMaterial({
     color: 0x6b3fa0, transparent:true, opacity:0.10,
@@ -1416,11 +1355,7 @@ function buildDiaphragm(){
   plane.rotation.x = -Math.PI/2;
   plane.position.set(3, 6.0, 3);
   diaphragmGroup.add(plane);
-
-  // Edges highlight on roof nodes 5–8
-  const ring = [
-    [5,6],[6,7],[7,8],[8,5]
-  ];
+  const ring = [[5,6],[6,7],[7,8],[8,5]];
   for (const [a,b] of ring){
     const p1 = new THREE.Vector3(...NODES[a]);
     const p2 = new THREE.Vector3(...NODES[b]);
@@ -1428,13 +1363,11 @@ function buildDiaphragm(){
     const m = new THREE.LineBasicMaterial({ color:0x6b3fa0, transparent:true, opacity:0.55 });
     diaphragmGroup.add(new THREE.Line(g, m));
   }
-  // Master star at node 5
   const starGeo = new THREE.SphereGeometry(0.20, 16, 16);
   const starMat = new THREE.MeshBasicMaterial({ color:0x6b3fa0 });
   const star = new THREE.Mesh(starGeo, starMat);
   star.position.set(...NODES[DIAPHRAGM.master]);
   diaphragmGroup.add(star);
-
   diaphragmGroup.visible = showDiaphragm;
 }
 
@@ -1452,7 +1385,6 @@ function buildMemberTubes(){
     const isColumn = mem[2] === 90;
     const sec = getSection(MEMBER_SECTIONS[idx]);
     const radius = Math.max(0.02, sec.d / 4);
-
     const geo = new THREE.CylinderGeometry(radius, radius, len, 14, 1);
     const mat = new THREE.MeshPhongMaterial({
       color: isColumn ? 0x6b3fa0 : 0x3060c0, shininess:40,
@@ -1517,7 +1449,6 @@ function onCanvasClick(ev){
     -((ev.clientY - rect.top)/rect.height)*2 + 1);
   const ray = new THREE.Raycaster();
   ray.setFromCamera(mouse, camera);
-
   const nodeHits = ray.intersectObjects(Object.values(nodeMeshes));
   if (nodeHits.length){
     selectedMembers.clear(); updateMemberHighlight();
@@ -1568,7 +1499,6 @@ function syncSectionDropdown(){
   }
 }
 
-/* ---- Draw active load case glyphs ------------------------------ */
 function clearGroup(g){
   while (g.children.length){
     const c = g.children.pop();
@@ -1580,18 +1510,12 @@ function drawActiveLoads(){
   clearGroup(loadGroup);
   if (!showArrows) { loadGroup.visible = false; return; }
   loadGroup.visible = true;
-
   const c = activeComboId !== null
     ? COMBINATIONS.find(x => x.id === activeComboId)
     : LOAD_CASES.find(x => x.id === activeCaseId);
   if (!c) return;
 
-  // For a combination, gather the union of member loads from referenced cases,
-  // scaled by factor.
-  const memberUDLs = [];  // { mi, w (kN/m), dir }
-  const memberPoints = []; // { mi, P, dir, loc }
-  const thermalMarks = []; // { mi, dT }
-  const nodalLoads = {}; // node -> [fx, fy, fz]
+  const memberUDLs = [], memberPoints = [], thermalMarks = [], nodalLoads = {};
 
   function addFromCase(caseId, factor){
     const lc = LOAD_CASES.find(x => x.id === caseId);
@@ -1629,7 +1553,6 @@ function drawActiveLoads(){
     addFromCase(activeCaseId, 1.0);
   }
 
-  // --- Nodal arrows ---
   for (const [nid, F] of Object.entries(nodalLoads)){
     const mag = Math.hypot(F[0], F[1], F[2]);
     if (mag < 1e-9) continue;
@@ -1641,23 +1564,19 @@ function drawActiveLoads(){
     loadGroup.add(new THREE.ArrowHelper(dir, origin, len, color, 0.28, 0.17));
   }
 
-  // --- Member UDLs: two short arrows along the member ---
   for (const { mi, w, dir } of memberUDLs){
     const [n1, n2, beta] = MEMBERS[mi];
     const { L } = memberTransform(n1, n2, beta);
     const p1 = new THREE.Vector3(...NODES[n1]);
     const p2 = new THREE.Vector3(...NODES[n2]);
-    const axis = p2.clone().sub(p1).normalize();
     const wDir = new THREE.Vector3(...dir).normalize();
     const mag = Math.abs(w);
     const len = Math.min(1.6, 0.5 + Math.log10(mag+1) * 0.5);
-    // Place 3 arrows along the span for visual clarity
     for (const t of [0.25, 0.5, 0.75]){
       const pos = p1.clone().lerp(p2, t);
       const origin = pos.clone().sub(wDir.clone().multiplyScalar(len));
       loadGroup.add(new THREE.ArrowHelper(wDir, origin, len, 0x1565c0, 0.15, 0.09));
     }
-    // Also draw a short "band" line along the member offset by wDir
     const offset = wDir.clone().multiplyScalar(0.12);
     const a = p1.clone().add(offset);
     const b = p2.clone().add(offset);
@@ -1666,7 +1585,6 @@ function drawActiveLoads(){
     loadGroup.add(new THREE.Line(g, m));
   }
 
-  // --- Member point loads ---
   for (const { mi, P, dir, loc } of memberPoints){
     const [n1, n2] = MEMBERS[mi];
     const p1 = new THREE.Vector3(...NODES[n1]);
@@ -1678,19 +1596,16 @@ function drawActiveLoads(){
     loadGroup.add(new THREE.ArrowHelper(wDir, origin, len, 0xc0392b, 0.24, 0.14));
   }
 
-  // --- Thermal markers (as small red cubes with text-like sprite) ---
   for (const { mi, dT } of thermalMarks){
     const [n1, n2] = MEMBERS[mi];
     const p1 = new THREE.Vector3(...NODES[n1]);
     const p2 = new THREE.Vector3(...NODES[n2]);
     const mid = p1.clone().lerp(p2, 0.5);
-    // small cube
     const geo = new THREE.BoxGeometry(0.22, 0.22, 0.22);
     const mat = new THREE.MeshBasicMaterial({ color:0xc0392b });
     const cube = new THREE.Mesh(geo, mat);
     cube.position.copy(mid);
     loadGroup.add(cube);
-    // canvas texture label
     const canvas = document.createElement('canvas');
     canvas.width = 128; canvas.height = 48;
     const ctx = canvas.getContext('2d');
@@ -1750,22 +1665,18 @@ function runAnalysis(){
     sm.textContent = 'Analysis failed';
     return;
   }
-
   let maxU = 0, maxR = 0;
   for (const v of RESULTS.U) if (Math.abs(v) > maxU) maxU = Math.abs(v);
   for (const v of RESULTS.R) if (Math.abs(v) > maxR) maxR = Math.abs(v);
   const maxUdisp = dD(maxU).toExponential(3);
   const maxRdisp = dF(maxR/1000).toFixed(3);
-
   const activeLabel = activeComboId !== null
     ? `COMBO ${activeComboId} · ${COMBINATIONS.find(c=>c.id===activeComboId).name}`
     : `LC${activeCaseId} · ${LOAD_CASES.find(c=>c.id===activeCaseId).name}`;
   document.getElementById('sb-active').textContent =
     activeComboId !== null ? ('C' + activeComboId) : ('LC' + activeCaseId);
-
   s.textContent = `${activeLabel}  ·  max|U| = ${maxUdisp} ${labD()}  ·  max|R| = ${maxRdisp} ${labF()}`;
   sm.textContent = `Solved · ${activeLabel}`;
-
   drawActiveLoads();
   drawDeformed();
   updateOverlay();
@@ -1778,13 +1689,9 @@ function refreshCurrentSheet(){
   if (active) setSheet(active.dataset.sheet);
 }
 function updateOverlay(){
-  document.getElementById('ov-loads').textContent = LOAD_CASES.length;
-  document.getElementById('sb-loads').textContent = LOAD_CASES.length;
-  document.getElementById('tree-loads').textContent = `Load Cases (${LOAD_CASES.length})`;
   document.getElementById('sb-combos').textContent = COMBINATIONS.length;
   updateMaterialLabels();
   updateSelectionOverlay();
-
   if (activeLoadSummary){
     document.getElementById('ov-total').textContent =
       `${dF(activeLoadSummary.totalApplied).toFixed(3)} ${labF()}`;
@@ -1795,7 +1702,6 @@ function updateOverlay(){
       : `${activeCaseId} · ${LOAD_CASES.find(c=>c.id===activeCaseId).name}`;
 }
 
-/* ---- Populate selectors ---------------------------------------- */
 function populateCaseSelect(){
   const sel = document.getElementById('case-select');
   sel.innerHTML = '';
@@ -1841,7 +1747,6 @@ function populateSectionSelect(){
   sel.value = currentSection;
 }
 
-/* ---- Event handlers -------------------------------------------- */
 function onCaseChange(v){
   activeCaseId = parseInt(v, 10);
   activeComboId = null;
@@ -1862,8 +1767,7 @@ function onSectionChange(name){
 }
 function applySectionToSelected(){
   if (selectedMembers.size === 0){
-    alert('No members selected. Click a member in the 3D view to select it,\n' +
-          'or use "All" to apply to every member.');
+    alert('No members selected. Click a member in the 3D view first.');
     return;
   }
   selectedMembers.forEach(i => MEMBER_SECTIONS[i] = currentSection);
@@ -1904,6 +1808,10 @@ window.addEventListener('load', ()=>{
   setSheet('loadcases');
   runAnalysis();
   updateOverlay();
+  refreshExcelStatus();
+  // Re-check server mode every 5 s so the badge self-heals if the app is
+  // restarted with different dependencies.
+  setInterval(refreshExcelStatus, 5000);
 });
 </script>
 </body>
@@ -1912,8 +1820,7 @@ window.addEventListener('load', ()=>{
 
 
 # ============================================================================
-# LIVE EXCEL BRIDGE  (unchanged from Rev 2, now receives the active case's
-# equivalent nodal load vector instead of the raw joint-load list)
+# LIVE EXCEL BRIDGE
 # ============================================================================
 EXCEL_FILENAME = "frame_analysis_live.xlsx"
 
@@ -1948,11 +1855,50 @@ def find_free_port(preferred=8765):
     raise RuntimeError("No free local port found for the Excel sync server.")
 
 
+def create_starter_workbook(path):
+    if openpyxl is None:
+        raise RuntimeError("openpyxl is required to create the starter workbook")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Inputs"
+    ws["A1"] = "Structural Solver · Rev 3 — Inputs"
+    ws["A1"].font = openpyxl.styles.Font(bold=True, size=13, color="4A2472")
+    ws["A3"] = "Units:"
+    ws["B3"] = "Metric (kN, m)"
+    ws["A4"] = "Material:"
+    ws["B4"] = "A992"
+    ws["C8"] = "Member"
+    ws["D8"] = "Section"
+    for i in range(12):
+        ws.cell(row=9 + i, column=3, value=f"M{i+1}")
+    ws["A23"] = "Nodal loads (equivalent, per active case/combo)"
+    headers = ["node", "fx", "fy", "fz", "mx", "my", "mz"]
+    for col, h in enumerate(headers, start=1):
+        c = ws.cell(row=24, column=col, value=h)
+        c.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+        c.fill = openpyxl.styles.PatternFill("solid", fgColor="6B3FA0")
+    for col, width in zip("ABCDEFG", (10, 12, 12, 12, 12, 12, 12)):
+        ws.column_dimensions[col].width = width
+    wb.save(path)
+    return path
+
+
+def ensure_workbook(path):
+    if os.path.isfile(path):
+        return False
+    try:
+        create_starter_workbook(path)
+        print(f"[Excel] Created starter workbook: {path}")
+        return True
+    except Exception as e:
+        print(f"[Excel] Could not create starter workbook at {path}: {e}")
+        return False
+
+
 class ExcelLink:
-    def __init__(self, path):
-        self.app  = xw.App(visible=True, add_book=False)
-        self.book = xw.Book(path)
-        self.sheet = self.book.sheets["Inputs"]
+    def __init__(self, book):
+        self.book = book
+        self.sheet = book.sheets["Inputs"]
 
     def write(self, state):
         sheet = self.sheet
@@ -1963,39 +1909,68 @@ class ExcelLink:
             sheet.range(f"D{9 + i}").value = SECTION_JS_TO_XLS.get(sec, sec)
         sheet.range(f"A{LOAD_ROW_START}:G{LOAD_ROW_MAX}").clear_contents()
         loads = state.get("loads") or []
+        n = 0
         for i, load in enumerate(loads[: LOAD_ROW_MAX - LOAD_ROW_START + 1]):
             row = LOAD_ROW_START + i
             for col_letter, key in zip("ABCDEFG", LOAD_COLS):
                 sheet.range(f"{col_letter}{row}").value = load.get(key, 0)
+            n += 1
+        return n
 
 
 def start_excel_link(path):
-    if xw is not None:
-        try:
-            return ExcelLink(path)
-        except Exception as e:
-            print(f"[xlwings] Could not attach a live Excel window ({e}).")
-            print("          Falling back to plain file writes.")
-    else:
-        print("[xlwings] Not installed -- falling back to plain file writes.")
-        print("          (pip install xlwings, on Windows or macOS with Excel")
-        print("           installed, for cells to update live on screen.)")
+    if xw is None:
+        print("[xlwings] NOT INSTALLED -- cells will not refresh while Excel "
+              "has the file open.")
+        print("          >>> pip install xlwings")
+        return None
+
+    target = os.path.abspath(path).lower()
+
+    # 1. Look for a running Excel with this exact book already open.
     try:
-        if sys.platform.startswith("win"):
-            os.startfile(path)  # noqa
-        elif sys.platform == "darwin":
-            os.system(f'open "{path}"')
-        else:
-            os.system(f'xdg-open "{path}"')
+        apps = list(xw.apps)
+    except Exception:
+        apps = []
+
+    for app in apps:
+        try:
+            for b in app.books:
+                try:
+                    if os.path.abspath(b.fullname).lower() == target:
+                        print("[xlwings] Attached to the workbook already open "
+                              "in your running Excel instance.")
+                        return ExcelLink(b)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # 2. Excel running, but the book isn't open -- open it in that instance.
+    if apps:
+        try:
+            book = apps[0].books.open(path)
+            print("[xlwings] Opened the workbook in your running Excel instance.")
+            return ExcelLink(book)
+        except Exception as e:
+            print(f"[xlwings] Could not open workbook in running Excel: {e}")
+
+    # 3. No Excel running -- start a fresh visible one.
+    try:
+        app = xw.App(visible=True, add_book=False)
+        book = app.books.open(path)
+        print("[xlwings] Started a fresh visible Excel with the workbook open.")
+        return ExcelLink(book)
     except Exception as e:
-        print(f"[open] Could not open {path} automatically: {e}")
-    return None
+        print(f"[xlwings] Could not start Excel: {e}")
+        return None
 
 
 def write_state_openpyxl(path, state):
     if openpyxl is None:
         return "error: openpyxl is not installed (pip install openpyxl)"
-    try:
+
+    def _try_write():
         wb = openpyxl.load_workbook(path)
         sheet = wb["Inputs"]
         sheet["B3"] = UNIT_JS_TO_XLS.get(state.get("units"), "Metric (kN, m)")
@@ -2012,29 +1987,97 @@ def write_state_openpyxl(path, state):
             for col_letter, key in zip("ABCDEFG", LOAD_COLS):
                 sheet[f"{col_letter}{row}"] = load.get(key, 0)
         wb.save(path)
-        return "ok (saved to disk -- reopen the file in Excel to see it)"
+
+    try:
+        _try_write()
+        return "ok (saved to disk -- close & reopen in Excel to see the new values)"
     except PermissionError:
-        return ("error: the .xlsx is open and locked by another program "
-                "(close it, or install xlwings for live writes while it's open)")
+        time.sleep(0.4)
+        try:
+            _try_write()
+            return "ok (saved to disk -- close & reopen in Excel to see the new values)"
+        except PermissionError:
+            # Last-ditch: try a fresh output filename that Excel can't lock.
+            alt = os.path.splitext(path)[0] + "_synced.xlsx"
+            try:
+                import shutil
+                shutil.copyfile(path, alt)
+                wb = openpyxl.load_workbook(alt)
+                sheet = wb["Inputs"]
+                sheet["B3"] = UNIT_JS_TO_XLS.get(state.get("units"), "Metric (kN, m)")
+                sheet["B4"] = state.get("material")
+                for i, sec in enumerate((state.get("sections") or [])[:12]):
+                    sheet[f"D{9 + i}"] = SECTION_JS_TO_XLS.get(sec, sec)
+                for row in range(LOAD_ROW_START, LOAD_ROW_MAX + 1):
+                    for col_letter in "ABCDEFG":
+                        sheet[f"{col_letter}{row}"] = None
+                for i, load in enumerate((state.get("loads") or [])[:20]):
+                    row = LOAD_ROW_START + i
+                    for col_letter, key in zip("ABCDEFG", LOAD_COLS):
+                        sheet[f"{col_letter}{row}"] = load.get(key, 0)
+                wb.save(alt)
+                return (f"ok (wrote fallback file {os.path.basename(alt)} -- "
+                        f"open it in Excel; the original is locked)")
+            except Exception as e2:
+                return (f"error: the .xlsx is open and locked by Excel, and the "
+                        f"fallback copy also failed ({e2}).  "
+                        f"Install xlwings (pip install xlwings) to write live.")
+        except Exception as e:
+            return f"error: {e}"
     except Exception as e:
         return f"error: {e}"
 
 
-def make_sync_handler(link_holder, excel_path):
+def make_sync_handler(link_holder, excel_path, html_text):
     class SyncHandler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
 
-        def _reply(self, body):
+        def _cors(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+        def _reply(self, body, content_type="text/plain; charset=utf-8"):
             data = body.encode("utf-8")
             self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
+            self._cors()
             self.end_headers()
             self.wfile.write(data)
 
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path in ("/", "/index.html"):
+                self._reply(html_text, "text/html; charset=utf-8")
+                return
+            if path == "/ping":
+                self._reply("ok")
+                return
+            if path == "/status":
+                mode = "live" if link_holder.get("link") is not None else "file"
+                self._reply(json.dumps({
+                    "mode": mode,
+                    "detail": link_holder.get("detail", ""),
+                    "workbook": excel_path,
+                    "xlwings_available": xw is not None,
+                    "openpyxl_available": openpyxl is not None,
+                }), "application/json")
+                return
+            self.send_response(404)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_POST(self):
-            if self.path != "/sync":
+            if self.path.split("?", 1)[0] != "/sync":
                 self._reply("error: unknown endpoint")
                 return
             length = int(self.headers.get("Content-Length", 0))
@@ -2046,15 +2089,16 @@ def make_sync_handler(link_holder, excel_path):
                 return
             n_loads = len(state.get("loads") or [])
             tag = state.get("activeCase", "?")
-            if link_holder["link"] is not None:
+            if link_holder.get("link") is not None:
                 try:
-                    link_holder["link"].write(state)
-                    print(f"[Excel] sync ok (live) [{tag}] -- {n_loads} node-load(s) written")
+                    written = link_holder["link"].write(state)
+                    print(f"[Excel] sync ok (live) [{tag}] -- {written} node-load(s) written")
                     self._reply("ok (live)")
                     return
                 except Exception as e:
                     print(f"[xlwings] write failed, switching to file mode: {e}")
                     link_holder["link"] = None
+                    link_holder["detail"] = f"xlwings write failed: {e}"
             result = write_state_openpyxl(excel_path, state)
             print(f"[Excel] sync {result} [{tag}] -- {n_loads} node-load(s) written")
             self._reply(result)
@@ -2069,51 +2113,68 @@ def excel_thread_main(excel_path, ready):
             pythoncom.CoInitialize()
         except ImportError:
             pass
+
     link = None
-    if not os.path.isfile(excel_path):
-        print(f"[Excel] {EXCEL_FILENAME} not found next to the script or in the "
-              f"current folder -- expected it at:\n  {excel_path}")
-    else:
-        print(f"[Excel] Using workbook: {excel_path}")
+    ensure_workbook(excel_path)
+
+    print("=" * 66)
+    print("  Structural Solver · Rev 3 -- Excel bridge")
+    print("=" * 66)
+    print(f"  Workbook    : {excel_path}")
+    print(f"  openpyxl    : {'OK' if openpyxl is not None else 'MISSING'}")
+    print(f"  xlwings     : {'OK' if xw is not None else 'MISSING'}")
+
+    if os.path.isfile(excel_path):
         link = start_excel_link(excel_path)
+
     if link is not None:
-        print("[Excel] LIVE MODE: attached to a real, visible Excel window.")
+        detail = "xlwings attached to a live Excel window"
+        print("  Mode        : LIVE  (cells refresh while Excel is open)")
+        print("  >>> In Excel, open the workbook above.  Cells A24:G31 will")
+        print("      update every time you change the load case / combo.")
     else:
-        print("[Excel] FILE MODE: no live Excel connection.")
-    link_holder = {"link": link}
-    handler_cls = make_sync_handler(link_holder, excel_path)
-    port = find_free_port()
+        detail = ("file mode -- close the workbook in Excel before each "
+                  "sync, or `pip install xlwings` for live cells")
+        print("  Mode        : FILE  (no live Excel link)")
+        if xw is None:
+            print("  >>> Install xlwings for live cells:")
+            print("        pip install xlwings")
+        print("  >>> Meanwhile: keep the workbook CLOSED in Excel while this")
+        print("      app runs, then open it to see the updated values.")
+    print("=" * 66)
+
+    link_holder = {"link": link, "detail": detail}
+    handler_cls = make_sync_handler(link_holder, excel_path, ready["html"])
+    port = ready["port"]
     server = HTTPServer(("127.0.0.1", port), handler_cls)
     ready["server"] = server
-    ready["port"] = port
     ready["event"].set()
     server.serve_forever()
 
 
-def start_sync_server(excel_path):
-    ready = {"event": threading.Event()}
+def start_sync_server(excel_path, html_template):
+    port = find_free_port()
+    html_text = html_template.replace("__SYNC_PORT__", str(port))
+    ready = {
+        "event": threading.Event(),
+        "html": html_text,
+        "port": port,
+        "server": None,
+    }
     t = threading.Thread(target=excel_thread_main, args=(excel_path, ready), daemon=True)
     t.start()
     if not ready["event"].wait(timeout=30):
         raise RuntimeError("Excel sync thread did not start in time.")
-    print(f"[Excel] Sync bridge listening on http://127.0.0.1:{ready['port']}/sync")
-    return ready["server"], ready["port"]
+    print(f"[Server] UI       : http://127.0.0.1:{port}/")
+    print(f"[Server] Status   : http://127.0.0.1:{port}/status")
+    print(f"[Server] Sync URL : http://127.0.0.1:{port}/sync")
+    return ready["server"], port
 
 
 # ============================================================================
 # LAUNCHER
 # ============================================================================
-def write_html_to_disk(sync_port):
-    folder = os.path.join(tempfile.gettempdir(), "structural_solver")
-    os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, "structural_solver_rev3.html")
-    html = HTML.replace("__SYNC_PORT__", str(sync_port))
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
-    return path
-
-
-def launch_native_window(html_path):
+def launch_native_window(url):
     try:
         import webview  # noqa
     except ImportError:
@@ -2121,7 +2182,7 @@ def launch_native_window(html_path):
     try:
         webview.create_window(
             "Structural Solver · Rev 3",
-            url=f"file:///{html_path.replace(os.sep, '/')}",
+            url=url,
             width=1420, height=900, resizable=True,
         )
         webview.start()
@@ -2131,27 +2192,38 @@ def launch_native_window(html_path):
         return False
 
 
-def launch_browser(html_path):
-    url = f"file:///{html_path.replace(os.sep, '/')}"
+def launch_browser(url):
     print(f"Opening Structural Solver Rev 3 in default browser:\n  {url}")
     webbrowser.open(url)
 
 
+def _idle_forever():
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+
+
 def main():
     excel_path = find_excel_path()
-    server, port = start_sync_server(excel_path)
-    html_path = write_html_to_disk(port)
-    print(f"HTML written to: {html_path}")
+    server, port = start_sync_server(excel_path, HTML)
+    url = f"http://127.0.0.1:{port}/"
     try:
         if "--browser" in sys.argv:
-            launch_browser(html_path)
+            launch_browser(url)
+            _idle_forever()
             return
-        if not launch_native_window(html_path):
+        if not launch_native_window(url):
             print("pywebview not available – falling back to default browser.")
             print("(Install for native window: pip install pywebview)")
-            launch_browser(html_path)
+            launch_browser(url)
+            _idle_forever()
     finally:
-        server.shutdown()
+        try:
+            server.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
